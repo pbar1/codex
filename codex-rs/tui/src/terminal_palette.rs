@@ -88,7 +88,7 @@ fn best_color_for_color_level(target: (u8, u8, u8), color_level: StdoutColorLeve
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DefaultColors {
     fg: (u8, u8, u8),
     bg: (u8, u8, u8),
@@ -140,6 +140,25 @@ pub(crate) fn set_default_colors_from_startup_probe(
     colors: Option<crate::terminal_probe::DefaultColors>,
 ) {
     imp::set_default_colors_from_startup_probe(colors);
+}
+
+/// Commit a complete refresh, retaining the last good palette on missing replies.
+#[cfg(unix)]
+pub(crate) fn update_default_colors(colors: Option<crate::terminal_probe::DefaultColors>) -> bool {
+    let Some(colors) = colors else {
+        return false;
+    };
+    let updated = DefaultColors {
+        fg: colors.fg,
+        bg: colors.bg,
+    };
+    if default_colors() == Some(updated) {
+        return false;
+    }
+    #[cfg(test)]
+    TEST_DEFAULT_COLORS.with(|value| value.set(Some(updated)));
+    imp::set_default_colors_from_startup_probe(Some(colors));
+    true
 }
 
 #[cfg(all(unix, not(test)))]
@@ -562,6 +581,29 @@ pub const XTERM_COLORS: [(u8, u8, u8); 256] = [
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    #[cfg(unix)]
+    fn palette_refresh_retains_last_good_colors_on_missing_replies() {
+        let dark = crate::terminal_probe::DefaultColors {
+            fg: (212, 190, 152),
+            bg: (29, 32, 33),
+        };
+        let light = crate::terminal_probe::DefaultColors {
+            fg: (101, 71, 53),
+            bg: (242, 229, 188),
+        };
+        with_test_default_colors(dark, || {
+            assert!(!update_default_colors(/*colors*/ None));
+            assert_eq!(default_bg(), Some(dark.bg));
+            assert!(update_default_colors(Some(light)));
+            assert_eq!(default_fg(), Some(light.fg));
+            assert_eq!(default_bg(), Some(light.bg));
+            assert!(!update_default_colors(Some(light)));
+            assert!(!update_default_colors(/*colors*/ None));
+            assert_eq!(default_bg(), Some(light.bg));
+        });
+    }
 
     #[test]
     fn best_color_uses_truecolor_without_quantization() {

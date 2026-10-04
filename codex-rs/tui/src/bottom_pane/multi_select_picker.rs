@@ -183,6 +183,7 @@ pub(crate) struct MultiSelectPicker {
 
     /// Footer line showing keyboard hints.
     footer_hint: Line<'static>,
+    footer_key_style: ratatui::style::Style,
 
     /// Current search/filter query entered by the user.
     search_query: String,
@@ -289,7 +290,11 @@ impl MultiSelectPicker {
     }
 
     fn footer_lines(&self, width: u16) -> Vec<Line<'_>> {
-        wrap_styled_line(&self.footer_hint, width.saturating_sub(/*rhs*/ 2))
+        let mut lines = wrap_styled_line(&self.footer_hint, width.saturating_sub(/*rhs*/ 2));
+        for line in &mut lines {
+            crate::key_hint::refresh_cached_hint_styles(line, self.footer_key_style);
+        }
+        lines
     }
 
     /// Calculates the height needed for the row list area.
@@ -854,6 +859,7 @@ impl MultiSelectPickerBuilder {
             app_event_tx: self.app_event_tx,
             header: Box::new(header),
             footer_hint: Line::from(instructions),
+            footer_key_style: crate::key_hint::key_hint_style(),
             ordering_enabled: self.ordering_enabled,
             require_selection: self.require_selection,
             keymap: self.keymap,

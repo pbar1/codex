@@ -18,6 +18,7 @@
 //!
 //! See https://ratatui.rs/recipes/apps/spawn-vim/ and https://www.reddit.com/r/rust/comments/1f3o33u/myterious_crossterm_input_after_running_vim for more details.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -52,6 +53,7 @@ pub trait EventSource: Send + 'static {
 /// This intermediate layer enables dropping/recreating the underlying EventStream (pause/resume) without rebuilding consumers.
 pub struct EventBroker<S: EventSource = CrosstermEventSource> {
     state: Mutex<EventBrokerState<S>>,
+    pending_input: Mutex<VecDeque<Event>>,
     resume_events_tx: watch::Sender<()>,
     pub(super) size_monitor: Option<SizeMonitor>,
 }
@@ -85,6 +87,7 @@ impl<S: EventSource + Default> EventBroker<S> {
         let (resume_events_tx, _resume_events_rx) = watch::channel(());
         Self {
             state: Mutex::new(EventBrokerState::Start),
+            pending_input: Mutex::new(VecDeque::new()),
             resume_events_tx,
             size_monitor: None,
         }
@@ -100,6 +103,26 @@ impl<S: EventSource + Default> EventBroker<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *state = EventBrokerState::Paused;
+    }
+
+    /// Wait for the dropped reader to relinquish its lock before probing the tty.
+    /// `try_read` acquires that lock but may remove one queued event; retain it ahead of
+    /// any input replayed by the probe. An empty `buffer_input` call is not a barrier.
+    #[cfg(unix)]
+    pub(super) fn synchronize_paused_reader(&self) {
+        if let Some(event) = crossterm::event::try_read() {
+            self.pending_input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(event);
+        }
+    }
+
+    pub(super) fn discard_pending_input(&self) {
+        self.pending_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Create a new instance of the underlying event source
@@ -232,7 +255,17 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                         }
                     }
                 };
-                match Pin::new(events).poll_next(cx) {
+                let pending = self
+                    .broker
+                    .pending_input
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front();
+                let polled = match pending {
+                    Some(event) => Poll::Ready(Some(Ok(event))),
+                    None => Pin::new(events).poll_next(cx),
+                };
+                match polled {
                     Poll::Ready(Some(Ok(event))) => Some(event),
                     Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
                         *state = EventBrokerState::Start;
@@ -304,8 +337,8 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
-                // Keep the startup-cached palette: querying terminal colors here blocks the
-                // input loop, and a direct probe would discard keys typed during the refresh.
+                // The app refreshes the palette through a bounded, input-preserving handoff.
+                // Never probe directly while this crossterm reader owns stdin.
                 Some(TuiEvent::FocusGained)
             }
             Event::FocusLost => {
@@ -445,6 +478,24 @@ mod tests {
         let (draw_tx, draw_rx) = broadcast::channel(1);
         let terminal_focused = Arc::new(AtomicBool::new(true));
         (broker, handle, draw_tx, draw_rx, terminal_focused)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn palette_handoff_keeps_queued_input_before_new_input() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker.clone(), draw_rx, terminal_focused);
+        let first = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let second = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        broker.pause_events();
+        broker
+            .pending_input
+            .lock()
+            .unwrap()
+            .push_back(Event::Key(first));
+        broker.resume_events();
+        handle.send(Ok(Event::Key(second)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Key(key)) if key == first));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Key(key)) if key == second));
     }
 
     #[tokio::test(flavor = "current_thread")]

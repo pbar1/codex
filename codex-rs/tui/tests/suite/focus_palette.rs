@@ -36,18 +36,95 @@ fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> R
     let mut terminal = PtyCodex::start(&repo_root, codex_home, &["--no-alt-screen"])?;
     terminal.wait_for_startup()?;
 
-    let startup_output_len = terminal.output.len();
     let focus_started = Instant::now();
     terminal.write_input(format!("\u{1b}[I{FOCUS_PROBE_INPUT}").as_bytes())?;
-    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started, startup_output_len)?;
+    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started)?;
 
     let delayed_input = format!("{FOCUS_PROBE_INPUT}-delayed");
     let delayed_focus_started = Instant::now();
     terminal.write_input(b"\x1b[I")?;
     terminal.read_output(Duration::from_millis(/*millis*/ 20))?;
     terminal.write_input(delayed_input.as_bytes())?;
-    terminal.wait_for_focus_input(&delayed_input, delayed_focus_started, startup_output_len)?;
+    terminal.wait_for_focus_input(&delayed_input, delayed_focus_started)?;
 
+    Ok(())
+}
+
+#[test]
+fn palette_refresh_preserves_interleaved_paste_and_last_good_shading() -> Result<()> {
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let codex_home = tempfile::tempdir()?;
+    write_test_config(codex_home.path(), &repo_root)?;
+    let mut terminal = PtyCodex::start(
+        &repo_root,
+        codex_home,
+        &["--no-alt-screen", "-c", "tui.theme=\"ansi\""],
+    )?;
+    terminal.wait_for_startup()?;
+    let offset = terminal.output.len();
+    terminal.wait_for_palette_query(offset)?;
+    terminal.write_input(b"typed-\x1b]10;rgb:ffff/ffff/ffff\x07\x1b]11;rgb:0000/0000/0000\x07")?;
+    terminal.wait_for_screen("typed-")?;
+    let offset = terminal.output.len();
+    terminal.wait_for_palette_query(offset)?;
+    terminal.write_input(
+        concat!(
+            "\x1b[200~日本語\nsecond line",
+            "\x1b]10;rgb:6565/4747/3535\x07",
+            "\x1b]11;rgb:f2f2/e5e5/bcbc\x07",
+            "\x1b[201~-after",
+        )
+        .as_bytes(),
+    )?;
+    terminal.wait_for_screen("typed-日本語")?;
+    terminal.wait_for_screen("second line-after")?;
+    let shaded_draft = |terminal: &PtyCodex, fill: vt100::Color| {
+        (0..32).any(|row| {
+            (0..120).any(|col| {
+                terminal
+                    .parser
+                    .screen()
+                    .cell(row, col)
+                    .is_some_and(|cell| cell.contents() == "日" && cell.bgcolor() == fill)
+            })
+        })
+    };
+    ensure!(
+        shaded_draft(&terminal, vt100::Color::Rgb(232, 219, 180)),
+        "refreshed input must retain the normal light fill: {}\ncell styles: {:?}",
+        terminal.screen_contents(),
+        (0..32)
+            .flat_map(|row| (0..120).map(move |col| (row, col)))
+            .filter_map(|(row, col)| terminal.parser.screen().cell(row, col))
+            .filter(|cell| cell.contents() == "日")
+            .map(|cell| (cell.fgcolor(), cell.bgcolor()))
+            .collect::<Vec<_>>()
+    );
+
+    // Withhold the next reply while more text arrives. The timeout must preserve both
+    // the draft and the last successful palette, rather than clearing either one.
+    let offset = terminal.output.len();
+    terminal.wait_for_palette_query(offset)?;
+    terminal.write_input(b"-timeout")?;
+    terminal.wait_for_screen("second line-after-timeout")?;
+    ensure!(
+        shaded_draft(&terminal, vt100::Color::Rgb(232, 219, 180)),
+        "missing replies changed the last good input shading"
+    );
+    // A missed reply must not impose the unsupported-terminal backoff on a terminal
+    // that has already answered. Recover on the next normal refresh.
+    let offset = terminal.output.len();
+    terminal.wait_for_palette_query(offset)?;
+    terminal.write_input(b"\x1b]10;rgb:d4d4/bebe/9898\x07\x1b]11;rgb:1d1d/2020/2121\x07")?;
+    let deadline = Instant::now() + FOCUS_INPUT_TIMEOUT;
+    while !shaded_draft(&terminal, vt100::Color::Rgb(56, 58, 59)) && Instant::now() < deadline {
+        terminal.read_output(Duration::from_millis(20))?;
+    }
+    ensure!(
+        shaded_draft(&terminal, vt100::Color::Rgb(56, 58, 59)),
+        "palette did not recover after a missed reply"
+    );
+    ensure!(terminal.screen_contains("second line-after-timeout"));
     Ok(())
 }
 
@@ -358,6 +435,10 @@ impl PtyCodex {
             .arg("-C")
             .arg(repo_root)
             .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env_remove("NO_COLOR")
+            .env_remove("FORCE_COLOR")
+            .env_remove("CLICOLOR_FORCE")
             // This PTY answers its own capability probes; it is not inside the caller's mux.
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
@@ -411,20 +492,9 @@ impl PtyCodex {
         );
     }
 
-    fn wait_for_focus_input(
-        &mut self,
-        input: &str,
-        focus_started: Instant,
-        startup_output_len: usize,
-    ) -> Result<()> {
+    fn wait_for_focus_input(&mut self, input: &str, focus_started: Instant) -> Result<()> {
         while focus_started.elapsed() < FOCUS_INPUT_TIMEOUT {
             self.read_output(Duration::from_millis(/*millis*/ 20))?;
-            let focus_output = &self.output[startup_output_len..];
-            ensure!(
-                !contains_bytes(focus_output, b"\x1b]10;?")
-                    && !contains_bytes(focus_output, b"\x1b]11;?"),
-                "focus regain queried terminal colors after the startup palette was cached",
-            );
             if self.screen_contains(input) {
                 return Ok(());
             }
@@ -436,6 +506,18 @@ impl PtyCodex {
             FOCUS_INPUT_TIMEOUT,
             self.screen_contents(),
         );
+    }
+
+    fn wait_for_palette_query(&mut self, offset: usize) -> Result<()> {
+        let deadline = Instant::now() + FOCUS_INPUT_TIMEOUT;
+        while Instant::now() < deadline {
+            self.read_output(Duration::from_millis(10))?;
+            let output = &self.output[offset..];
+            if contains_bytes(output, b"\x1b]10;?") && contains_bytes(output, b"\x1b]11;?") {
+                return Ok(());
+            }
+        }
+        bail!("running Codex did not refresh its terminal palette")
     }
 
     fn answer_startup_queries(&mut self) -> Result<()> {

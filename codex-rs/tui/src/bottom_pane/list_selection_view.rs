@@ -303,6 +303,7 @@ pub(crate) struct ListSelectionView {
     view_id: Option<&'static str>,
     footer_note: Option<Line<'static>>,
     footer_hint: Option<Line<'static>>,
+    footer_key_style: ratatui::style::Style,
     tab_footer_hints: Vec<(String, Line<'static>)>,
     items: Vec<SelectionItem>,
     tabs: Vec<SelectionTab>,
@@ -443,6 +444,7 @@ impl ListSelectionView {
             view_id: params.view_id,
             footer_note: params.footer_note,
             footer_hint: params.footer_hint,
+            footer_key_style: crate::key_hint::key_hint_style(),
             tab_footer_hints: params.tab_footer_hints,
             items: params.items,
             tabs: params.tabs,
@@ -934,6 +936,9 @@ impl ListSelectionView {
             return Vec::new();
         };
         let mut lines = wrap_styled_line(hint, width);
+        for line in &mut lines {
+            crate::key_hint::refresh_cached_hint_styles(line, self.footer_key_style);
+        }
         if self.reserve_result_rows {
             let height = self
                 .tab_footer_hints

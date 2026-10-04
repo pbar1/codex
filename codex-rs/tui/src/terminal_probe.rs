@@ -7,7 +7,7 @@
 //! prefers duplicated stdio handles, falls back to the controlling terminal path when stdio is
 //! unavailable, and reports `None` when a response is unavailable.
 //!
-//! Probes run only while the crossterm event stream is absent or paused. Startup replays consumed
+//! Probes run only while the crossterm event stream is absent or paused. Probes replay consumed
 //! terminal bytes through crossterm's parser so interleaved user input remains available after the
 //! probe completes.
 
@@ -311,19 +311,38 @@ mod imp {
 
     /// Reads available terminal bytes until `parse` recognizes a probe response or time expires.
     ///
-    /// The accumulated buffer may include unrelated terminal input. This helper intentionally does
-    /// not try to replay those bytes, so callers must use it only during short, exclusive probe
-    /// windows before normal crossterm input polling begins or while that polling is paused.
+    /// Replay interleaved input even on timeout or I/O failure. The normal event stream must be
+    /// paused for the entire probe; never flush its input queue when resuming.
     fn read_until<T>(
         tty: &mut Tty,
         timeout: Duration,
+        parse: impl FnMut(&[u8]) -> Option<T>,
+    ) -> io::Result<Option<T>> {
+        read_with_replay(tty, timeout, parse, crossterm::event::buffer_input)
+    }
+
+    fn read_with_replay<T>(
+        tty: &mut Tty,
+        timeout: Duration,
+        parse: impl FnMut(&[u8]) -> Option<T>,
+        replay: impl FnOnce(&[u8]) -> io::Result<()>,
+    ) -> io::Result<Option<T>> {
+        let mut buffer = Vec::new();
+        let result = read_response(tty, timeout, parse, &mut buffer);
+        replay(&startup_replay_input(&buffer))?;
+        result
+    }
+
+    fn read_response<T>(
+        tty: &mut Tty,
+        timeout: Duration,
         mut parse: impl FnMut(&[u8]) -> Option<T>,
+        buffer: &mut Vec<u8>,
     ) -> io::Result<Option<T>> {
         let deadline = Instant::now() + timeout;
-        let mut buffer = Vec::new();
         loop {
-            tty.read_available(&mut buffer, deadline, MAX_TERMINAL_PROBE_BYTES)?;
-            if let Some(value) = parse(&buffer) {
+            tty.read_available(buffer, deadline, MAX_TERMINAL_PROBE_BYTES)?;
+            if let Some(value) = parse(buffer) {
                 return Ok(Some(value));
             }
             let now = Instant::now();
@@ -566,6 +585,32 @@ mod imp {
             let reader: OwnedFd = reader.into();
             let writer: OwnedFd = writer.into();
             Tty::new(reader.into(), writer.into()).expect("create terminal probe")
+        }
+
+        #[test]
+        fn palette_probe_replays_typing_and_unicode_paste_with_or_without_replies() {
+            let typed = "draft\x1b[200~hello 日本語\nworld\x1b[201~suffix";
+            for replies in [
+                "\x1b]10;rgb:d4d4/bebe/9898\x07\x1b]11;rgb:1d1d/2020/2121\x1b\\",
+                "",
+                "\x1b]10;rgb:d4d4/bebe/9898\x07",
+            ] {
+                let input = format!("{typed}{replies}");
+                let mut tty = tty_with_buffered_input(input.as_bytes());
+                let mut replayed = Vec::new();
+                let colors = read_with_replay(
+                    &mut tty,
+                    Duration::from_millis(5),
+                    parse_default_colors,
+                    |bytes| {
+                        replayed.extend_from_slice(bytes);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(replayed, typed.as_bytes());
+                assert_eq!(colors.is_some(), replies.contains("]11;"));
+            }
         }
 
         #[test]

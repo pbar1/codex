@@ -253,7 +253,7 @@ impl From<ShortcutHint> for Span<'static> {
     }
 }
 
-fn key_hint_style() -> Style {
+pub(crate) fn key_hint_style() -> Style {
     let preferred = match (
         crate::terminal_palette::default_fg(),
         crate::terminal_palette::default_bg(),
@@ -269,6 +269,17 @@ fn key_hint_style() -> Style {
         ))
         .bold()
         .not_dim()
+}
+
+/// Hints stored by an open picker must use the same colors as newly constructed hints.
+/// Only replace the key-label style captured when the hint was built; retain custom styling.
+pub(crate) fn refresh_cached_hint_styles(line: &mut ratatui::text::Line<'_>, captured: Style) {
+    let current = key_hint_style();
+    for span in &mut line.spans {
+        if span.style == captured {
+            span.style = current;
+        }
+    }
 }
 
 /// Emphasize the complete key label, including chords, alternatives, and literal punctuation.

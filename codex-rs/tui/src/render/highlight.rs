@@ -272,6 +272,11 @@ pub(crate) fn set_syntax_theme(theme: Theme) {
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = theme;
+    invalidate_rendered_colors();
+}
+
+/// Palette changes also invalidate styles baked into streaming and transcript caches.
+pub(crate) fn invalidate_rendered_colors() {
     #[cfg(not(test))]
     THEME_REVISION.fetch_add(1, Ordering::Release);
     #[cfg(test)]

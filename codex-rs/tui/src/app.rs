@@ -847,6 +847,28 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        let palette_changed = if matches!(
+            event,
+            TuiEvent::Draw | TuiEvent::FocusGained | TuiEvent::Resume | TuiEvent::Resize(_)
+        ) {
+            tui.refresh_palette().await
+        } else {
+            false
+        };
+        // Keep explicit themes and unsaved picker previews. Reconcile automatic selection once
+        // the popup closes, using the refreshed terminal background.
+        if tui.palette_theme_dirty && !self.chat_widget.has_active_view() && self.overlay.is_none()
+        {
+            if self.local_settings.tui.theme.is_none() {
+                self.restore_runtime_theme_from_config();
+            }
+            tui.palette_theme_dirty = false;
+            self.refresh_status_line();
+            self.schedule_immediate_resize_reflow(tui);
+        } else if palette_changed {
+            self.refresh_status_line();
+            self.schedule_immediate_resize_reflow(tui);
+        }
         tui.link_hover.observe(&event);
         self.refresh_link_hover(tui)?;
         self.invalidate_right_click_paste(&event);

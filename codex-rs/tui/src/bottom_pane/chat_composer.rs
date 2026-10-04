@@ -5019,6 +5019,66 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn refreshed_palette_matches_fresh_composer_in_both_appearances() {
+        use crate::render::highlight;
+        use crate::terminal_palette::update_default_colors;
+        use crate::terminal_palette::with_test_default_colors;
+        use crate::terminal_probe::DefaultColors;
+
+        let original = highlight::current_syntax_theme();
+        let dark = DefaultColors {
+            fg: (212, 190, 152),
+            bg: (29, 32, 33),
+        };
+        let light = DefaultColors {
+            fg: (101, 71, 53),
+            bg: (242, 229, 188),
+        };
+        let draft = "Keep this draft while changing appearance";
+        let area = Rect::new(0, 0, 64, 6);
+        let render = |composer: &ChatComposer| {
+            let mut buffer = Buffer::empty(area);
+            composer.render(area, &mut buffer);
+            buffer
+        };
+        for theme_name in [
+            "ansi",
+            "base16",
+            "base16-256",
+            "base16-eighties-dark",
+            "base16-mocha-dark",
+            "base16-ocean-dark",
+            "base16-ocean-light",
+        ] {
+            highlight::set_syntax_theme(
+                highlight::resolve_theme_by_name(theme_name, /*codex_home*/ None).unwrap(),
+            );
+            with_test_default_colors(dark, || {
+                let (mut composer, _rx) = new_test_composer();
+                composer.insert_str(draft);
+                for (colors, fill) in [
+                    (light, (232, 219, 180)),
+                    (dark, (56, 58, 59)),
+                    (light, (232, 219, 180)),
+                ] {
+                    assert!(update_default_colors(Some(colors)));
+                    let actual = render(&composer);
+                    let expected = with_test_default_colors(colors, || {
+                        let (mut fresh, _rx) = new_test_composer();
+                        fresh.insert_str(draft);
+                        render(&fresh)
+                    });
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual[(0, 1)].bg, crate::terminal_palette::rgb_color(fill));
+                    assert_eq!(composer.draft.textarea.text(), draft);
+                }
+            });
+        }
+        highlight::set_syntax_theme(original);
+    }
+
+    #[test]
     fn light_terminal_palette_renders_light_composer_snapshot() {
         let colors = crate::terminal_probe::DefaultColors {
             fg: (0x55, 0x57, 0x53),

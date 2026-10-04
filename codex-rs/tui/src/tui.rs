@@ -658,6 +658,9 @@ pub struct Tui {
     frame_requester: FrameRequester,
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
+    #[cfg(unix)]
+    next_palette_check: std::time::Instant,
+    pub(crate) palette_theme_dirty: bool,
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<PendingHistoryLines>,
     clear_thread_switch_on_draw: bool,
@@ -735,6 +738,9 @@ impl Tui {
             frame_requester,
             draw_tx,
             event_broker: Arc::new(event_broker),
+            #[cfg(unix)]
+            next_palette_check: std::time::Instant::now() + Duration::from_secs(1),
+            palette_theme_dirty: false,
             terminal,
             pending_history_lines: vec![],
             clear_thread_switch_on_draw: false,
@@ -870,6 +876,65 @@ impl Tui {
         self.event_broker.resume_events();
     }
 
+    /// Refresh terminal defaults without changing any of the normal rendering formulas.
+    ///
+    /// Polling also covers terminals/tmux sessions that do not forward appearance notifications.
+    /// The event loop retains exclusive ownership of this handoff: an editor or suspend cannot
+    /// start until the bounded probe has replayed any input it consumed and polling has resumed.
+    #[cfg(unix)]
+    pub(crate) async fn refresh_palette(&mut self) -> bool {
+        const INTERVAL: Duration = Duration::from_secs(1);
+        const RETRY: Duration = Duration::from_secs(30);
+        const TIMEOUT: Duration = Duration::from_millis(100);
+        let now = std::time::Instant::now();
+        if now < self.next_palette_check {
+            self.frame_requester
+                .schedule_frame_in(self.next_palette_check - now);
+            return false;
+        }
+
+        self.event_broker.pause_events();
+        let broker = Arc::clone(&self.event_broker);
+        let sample = tokio::task::spawn_blocking(move || {
+            broker.synchronize_paused_reader();
+            crate::terminal_probe::default_colors(TIMEOUT)
+        })
+        .await;
+        self.event_broker.resume_events();
+        let colors = match sample {
+            Ok(Ok(colors)) => colors,
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "terminal palette refresh failed");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, "terminal palette refresh task failed");
+                None
+            }
+        };
+        // A missed reply from a terminal that has already answered must not leave its old
+        // palette visible for the unsupported-terminal backoff period.
+        let interval = if colors.is_some() || crate::terminal_palette::default_colors().is_some() {
+            INTERVAL
+        } else {
+            RETRY
+        };
+        self.next_palette_check = std::time::Instant::now() + interval;
+        self.frame_requester.schedule_frame_in(interval);
+        let changed = crate::terminal_palette::update_default_colors(colors);
+        if changed {
+            self.palette_theme_dirty = true;
+            crate::render::highlight::invalidate_rendered_colors();
+            self.terminal.invalidate_viewport();
+        }
+        changed
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) async fn refresh_palette(&mut self) -> bool {
+        false
+    }
+
     /// Discover the visible Windows theme only after protected startup decisions have completed.
     #[cfg(windows)]
     pub(crate) fn probe_default_colors_after_protected_startup(&mut self) {
@@ -909,6 +974,7 @@ impl Tui {
     /// drain all input through crossterm so incomplete bracketed paste remains safely framed.
     pub(crate) fn discard_pending_input_before_interactive_screen(&mut self) -> Result<()> {
         self.pause_events();
+        self.event_broker.discard_pending_input();
         let drain_result = discard_pending_terminal_input();
         self.resume_events();
         drain_result

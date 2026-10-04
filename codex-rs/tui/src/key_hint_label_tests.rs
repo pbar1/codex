@@ -8,6 +8,36 @@ use ratatui::style::Modifier;
 use ratatui::widgets::Paragraph;
 
 #[test]
+fn cached_picker_hint_matches_a_fresh_hint_after_palette_refresh() {
+    use crate::terminal_palette::with_test_default_colors;
+    use crate::terminal_probe::DefaultColors;
+    let dark = DefaultColors {
+        fg: (212, 190, 152),
+        bg: (29, 32, 33),
+    };
+    let light = DefaultColors {
+        fg: (101, 71, 53),
+        bg: (242, 229, 188),
+    };
+    let (cached, captured) = with_test_default_colors(dark, || {
+        (
+            crate::bottom_pane::popup_consts::standard_popup_hint_line(),
+            key_hint_style(),
+        )
+    });
+    for colors in [light, dark] {
+        with_test_default_colors(colors, || {
+            let mut refreshed = cached.clone();
+            refresh_cached_hint_styles(&mut refreshed, captured);
+            assert_eq!(
+                refreshed,
+                crate::bottom_pane::popup_consts::standard_popup_hint_line()
+            );
+        });
+    }
+}
+
+#[test]
 fn modifier_combinations_stay_compact_inside_chords() {
     let cases = [
         (KeyModifiers::CONTROL, "⌃t"),
